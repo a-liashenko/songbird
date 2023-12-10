@@ -59,48 +59,61 @@ pub fn mix_symph_indiv(
         // fetch a packet: either in progress, passthrough (early exit), or
         let source_packet = if local_state.inner_pos != 0 {
             Some(input.decoder.last_decoded())
-        } else if let Ok(pkt) = input.format.next_packet() {
-            if pkt.track_id() != input.track_id {
-                continue;
-            }
-
-            let buf = pkt.buf();
-
-            // Opus packet passthrough special case.
-            if codec_type == CODEC_TYPE_OPUS && local_state.passthrough != Passthrough::Block {
-                if let Some(slot) = opus_slot.as_mut() {
-                    let sample_ct = buf
-                        .try_into()
-                        .and_then(|buf| audiopus::packet::nb_samples(buf, SAMPLE_RATE));
-
-                    // We don't actually block passthrough until a few violations are
-                    // seen. The main one is that most Opus tracks end on a sub-20ms
-                    // frame, particularly on Youtube.
-                    // However, a frame that's bigger than the target buffer is an instant block.
-                    let buf_size_fatal = buf.len() <= slot.len();
-
-                    if match sample_ct {
-                        Ok(MONO_FRAME_SIZE) => true,
-                        _ => !local_state.record_and_check_passthrough_strike_final(buf_size_fatal),
-                    } {
-                        slot.write_all(buf)
-                            .expect("Bounds check performed, and failure will block passthrough.");
-
-                        return (MixType::Passthrough(buf.len()), MixStatus::Live);
-                    }
-                }
-            }
-
-            input
-                .decoder
-                .decode(&pkt)
-                .map_err(|e| {
-                    track_status = e.into();
-                })
-                .ok()
         } else {
-            track_status = MixStatus::Ended;
-            None
+            match input.format.next_packet() {
+                Err(e) => {
+                    if let symphonia_core::errors::Error::DecodeError(e) = e {
+                        tracing::warn!("Failed to decode source {e:?}");
+                        continue;
+                    }
+                    track_status = MixStatus::Ended;
+                    None
+                },
+                Ok(pkt) => {
+                    if pkt.track_id() != input.track_id {
+                        continue;
+                    }
+
+                    let buf = pkt.buf();
+
+                    // Opus packet passthrough special case.
+                    if codec_type == CODEC_TYPE_OPUS
+                        && local_state.passthrough != Passthrough::Block
+                    {
+                        if let Some(slot) = opus_slot.as_mut() {
+                            let sample_ct = buf
+                                .try_into()
+                                .and_then(|buf| audiopus::packet::nb_samples(buf, SAMPLE_RATE));
+
+                            // We don't actually block passthrough until a few violations are
+                            // seen. The main one is that most Opus tracks end on a sub-20ms
+                            // frame, particularly on Youtube.
+                            // However, a frame that's bigger than the target buffer is an instant block.
+                            let buf_size_fatal = buf.len() <= slot.len();
+
+                            if match sample_ct {
+                                Ok(MONO_FRAME_SIZE) => true,
+                                _ => !local_state
+                                    .record_and_check_passthrough_strike_final(buf_size_fatal),
+                            } {
+                                slot.write_all(buf).expect(
+                                    "Bounds check performed, and failure will block passthrough.",
+                                );
+
+                                return (MixType::Passthrough(buf.len()), MixStatus::Live);
+                            }
+                        }
+                    }
+
+                    input
+                        .decoder
+                        .decode(&pkt)
+                        .map_err(|e| {
+                            track_status = e.into();
+                        })
+                        .ok()
+                },
+            }
         };
 
         // Cleanup: failed to get the next packet, but still have to convert and mix scratch.
